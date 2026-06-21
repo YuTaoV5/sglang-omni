@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 _FAILED_BATCH_RESULT = object()
 
 
-# Local PD event names. Mirrored in tests/unit_test/pipeline/test_thinker_pd_scheduler.py.
 _PD_READY_ENTER_EVENT = "pd_ready_enter"
 _PD_READY_ADMIT_EVENT = "pd_ready_admit"
 _PD_READY_DROP_EVENT = "pd_ready_drop"
@@ -122,14 +121,10 @@ class OmniScheduler:
         async_decode_min_batch_size: int = 2,
         enable_local_pd: bool = False,
     ):
-        # --- Local prefill/decode scheduler (sgl-project/sglang-omni#841) ---
-        # Mutually exclusive with enable_overlap and enable_async_decode: we
-        # gate the ready-decode list at the start of every decode step, and
-        # overlap/async_decode own that step in their own event loops.
         if enable_local_pd and (enable_overlap or enable_async_decode):
             raise ValueError(
                 "OmniScheduler: enable_local_pd is mutually exclusive with "
-                "enable_overlap and enable_async_decode"
+                "enable_overlap / enable_async_decode"
             )
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
@@ -170,7 +165,6 @@ class OmniScheduler:
         if model_runner is not None:
             model_runner._async_enabled = enable_async_decode
 
-        # --- Local prefill/decode scheduler state (sgl-project/sglang-omni#841) ---
         self._local_pd_enabled = bool(enable_local_pd)
         self._ready_decode: list[str] = []
         self._ready_decode_limit = (
@@ -885,8 +879,6 @@ class OmniScheduler:
         self._running = False
 
     def abort(self, request_id: str, *, defer_running_cleanup: bool = True) -> None:
-        # Local PD scheduler (sgl-project/sglang-omni#841): pull the rid off
-        # the ready-decode FIFO if it's still queued there.
         self._local_pd_abort(request_id)
         running_abort = (
             self._mark_running_request_aborted(request_id)
@@ -1372,7 +1364,6 @@ class OmniScheduler:
             return
         release_kv_cache(req, self.tree_cache)
 
-    # --- Local PD scheduler helpers (sgl-project/sglang-omni#841) ---
     def _local_pd_enqueue_ready(self, rid: str) -> None:
         if not self._local_pd_enabled or rid is None:
             return
@@ -1396,20 +1387,24 @@ class OmniScheduler:
                 metadata={"queue_size": len(self._ready_decode)},
             )
 
-    def _local_pd_drain_into_batch(self, batch: Any) -> None:
-        if (
-            not self._local_pd_enabled
-            or not self._ready_decode
-            or batch is None
-        ):
+    def _local_pd_admit_into_waiting_queue(self) -> None:
+        """Drain the ready-decode queue (events only; no req transfer).
+
+        Earlier prototypes tried to physically transfer prefilled requests
+        from the running batch to the head of the waiting queue, but that
+        desyncs the per-req state arrays sglang's filter_batch /
+        update_running_batch rely on (multimodal_inputs, req_pool_indices,
+        seq_lens, output_ids, …) and corrupts the req_to_token pool.
+
+        This implementation only emits the admit events and clears the
+        FIFO; the upstream scheduler decides what to do with prefilled
+        requests. The events are still useful as a measurement hook for
+        follow-up A100 reproduction: ``pd_ready_admit`` is emitted when a
+        prefilled request would have been drained into the next decode
+        step.
+        """
+        if not self._local_pd_enabled or not self._ready_decode:
             return
-        # Only drain when we are about to issue a decode step.
-        mode = getattr(batch, "forward_mode", None)
-        is_decode = bool(getattr(mode, "is_decode", lambda: False)())
-        if not is_decode:
-            return
-        # Emit admit events in FIFO order; reverse-iterate for insert(0) so
-        # batch.reqs ends up in FIFO order at the front.
         now = time.monotonic()
         snapshot = list(self._ready_decode)
         for rid in snapshot:
@@ -1420,13 +1415,6 @@ class OmniScheduler:
                 event_name=_PD_READY_ADMIT_EVENT,
                 metadata={"ready_wait_ms": wait_ms},
             )
-        for rid in reversed(snapshot):
-            try:
-                batch.reqs.insert(0, rid)
-            except Exception:
-                # If the batch is frozen, skip silently; the upstream loop
-                # will pick the rid up on the next decode step.
-                continue
         self._ready_decode.clear()
 
     def _local_pd_abort(self, rid: str) -> None:
@@ -1437,12 +1425,6 @@ class OmniScheduler:
             self._ready_enter_ts.pop(rid, None)
 
     def _local_pd_enqueue_from_batch(self, batch: Any) -> None:
-        """Enqueue every rid in ``batch.reqs`` onto the ready-decode queue.
-
-        Called after a prefill batch has been run and its requests joined
-        the running set; we hold them on the ready-decode FIFO so the next
-        decode step can drain them. Skips already-queued rids (idempotent).
-        """
         if not self._local_pd_enabled or batch is None:
             return
         for req in getattr(batch, "reqs", []) or []:
@@ -1471,16 +1453,9 @@ class OmniScheduler:
             self.cur_batch = batch
 
             if batch:
-                # Local PD scheduler (sgl-project/sglang-omni#841): drain
-                # any rids already sitting on the ready-decode FIFO onto the
-                # front of the upcoming batch before running it.
-                self._local_pd_drain_into_batch(batch)
                 result = self.run_batch(batch)
                 if result is not _FAILED_BATCH_RESULT:
                     self.process_batch_result(batch, result)
-                    # If this was a prefill batch, push the now-prefilled
-                    # rids onto the ready-decode list so the next decode
-                    # step (which may include them) sees them as ready.
                     mode = getattr(batch, "forward_mode", None)
                     is_decode = bool(
                         getattr(mode, "is_decode", lambda: False)()
@@ -1490,6 +1465,10 @@ class OmniScheduler:
             else:
                 self.self_check_during_idle()
                 time.sleep(0.001)
+
+            # If there are rids waiting on the ready-decode FIFO, emit the
+            # admit events and clear the FIFO.
+            self._local_pd_admit_into_waiting_queue()
 
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():

@@ -97,14 +97,7 @@ class Environ:
     # logging
     SGLOMNI_LOG_LEVEL = EnvStr("INFO")
 
-    # Thinker local prefill/decode scheduler (refs sgl-project/sglang-omni#841).
-    # When 1, thinker's OmniScheduler decouples prefill admission from decode
-    # admission: prefill outputs sit on a ready-decode FIFO before joining the
-    # running decode set. Mutually exclusive with enable_overlap /
-    # enable_async_decode.
     SGLANG_OMNI_ENABLE_THINKER_PD = EnvBool(False)
-    # Cap on the ready-decode list length; older rids are dropped (forced back
-    # into the running set) when this is exceeded.
     SGLANG_OMNI_THINKER_PD_READY_DECODE_LIMIT = EnvInt(32)
 
     def __new__(cls):

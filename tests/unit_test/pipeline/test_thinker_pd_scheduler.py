@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the thinker local PD scheduler path.
-
-Refs sgl-project/sglang-omni#841. These tests cover the constructor and
-the ready-decode queue helpers. They use a lightweight stub instead of
-constructing a real OmniScheduler so they run on CPU with no torch / cuda.
-"""
+"""Unit tests for the thinker local PD scheduler path."""
 
 from __future__ import annotations
 
