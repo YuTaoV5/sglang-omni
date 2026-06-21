@@ -1365,7 +1365,7 @@ class OmniScheduler:
         release_kv_cache(req, self.tree_cache)
 
     def _local_pd_enqueue_ready(self, rid: str) -> None:
-        if not self._local_pd_enabled or rid is None:
+        if not getattr(self, "_local_pd_enabled", False) or rid is None:
             return
         if rid in self._ready_decode:
             return  # idempotent
@@ -1403,7 +1403,10 @@ class OmniScheduler:
         prefilled request would have been drained into the next decode
         step.
         """
-        if not self._local_pd_enabled or not self._ready_decode:
+        if not getattr(self, "_local_pd_enabled", False):
+            return
+        ready = getattr(self, "_ready_decode", None)
+        if not ready:
             return
         now = time.monotonic()
         snapshot = list(self._ready_decode)
@@ -1418,14 +1421,15 @@ class OmniScheduler:
         self._ready_decode.clear()
 
     def _local_pd_abort(self, rid: str) -> None:
-        if not self._local_pd_enabled or rid is None:
+        if not getattr(self, "_local_pd_enabled", False) or rid is None:
             return
-        if rid in self._ready_decode:
-            self._ready_decode.remove(rid)
-            self._ready_enter_ts.pop(rid, None)
+        ready = getattr(self, "_ready_decode", None)
+        if ready is not None and rid in ready:
+            ready.remove(rid)
+            getattr(self, "_ready_enter_ts", {}).pop(rid, None)
 
     def _local_pd_enqueue_from_batch(self, batch: Any) -> None:
-        if not self._local_pd_enabled or batch is None:
+        if not getattr(self, "_local_pd_enabled", False) or batch is None:
             return
         for req in getattr(batch, "reqs", []) or []:
             rid = getattr(req, "rid", None)
