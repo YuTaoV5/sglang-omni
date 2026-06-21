@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.environ import OMNIENV
+
 
 def create_thinker_scheduler(
     server_args: Any,
@@ -99,6 +101,7 @@ def create_thinker_scheduler(
         request_builder=request_builder,
         result_adapter=result_adapter,
         stream_output_builder=stream_output_builder,
+        enable_local_pd=OMNIENV.SGLANG_OMNI_ENABLE_THINKER_PD.get() or False,
     )
 
 
